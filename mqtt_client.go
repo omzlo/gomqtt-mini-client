@@ -1,10 +1,16 @@
-package mqtt_mini_client
+package gomqtt_mini_client
 
 import (
+	"crypto/tls"
 	"fmt"
+	"github.com/omzlo/clog"
 	"net"
+	"net/url"
+	"os"
 	"time"
 )
+
+var Logger *clog.LogManager = clog.DefaultLogManager
 
 type MqttTransaction struct {
 	ExpectedControlPacketType MqttControlPacketType
@@ -15,15 +21,15 @@ type MqttTransaction struct {
 
 type MqttClient struct {
 	Connected         bool
+	RetryConnect      bool
 	ClientIdentifier  string
-	Conn              *net.TCPConn
+	Conn              net.Conn
 	SubscribeCallback MqttCallback
 	PingInterval      uint16
 	Transactions      map[uint16]*MqttTransaction
 	Terminate         chan bool
 	LastTransaction   uint16
-	ServerName        string
-	ServerAddr        *net.TCPAddr
+	ServerURL         *url.URL
 	TXQueue           chan *MqttMessage
 	RXQueue           chan *MqttMessage
 	Ticker            *time.Ticker
@@ -58,12 +64,47 @@ func (c *MqttClient) releaseTransaction(transaction *MqttTransaction) {
 }
 
 func defaultSubscribeCallback(topic string, value []byte) {
-	fmt.Printf("Topic '%s' updated to %q\n", topic, value)
+	Logger.Debug("Topic '%s' updated to %q\n", topic, value)
 }
 
-func NewMqttClient(client_id string, server string) *MqttClient {
+func (c *MqttClient) checkConnection() error {
+	if c.Connected {
+		return nil
+	}
+	return fmt.Errorf("Not connected to %s://%s", c.ServerURL.Scheme, c.ServerURL.Host)
+}
+
+func NewMqttClient(client_id string, server string) (*MqttClient, error) {
+	u, err := url.Parse(server)
+
+	if err != nil {
+		return nil, err
+	}
+
+	switch u.Scheme {
+	case "":
+		u.Scheme = "mqtt"
+	case "mqtt", "mqtts":
+		/* fall through */
+	default:
+		return nil, fmt.Errorf("Unrecognized scheme in URL for mqtt: %s", u.Scheme)
+	}
+
+	if u.Port() == "" {
+		if u.Scheme == "mqtts" {
+			u.Host += ":8883"
+		} else {
+			u.Host += ":1883"
+		}
+	}
+
+	if client_id == "" {
+		client_id = fmt.Sprintf("gomqtt_mini_client-%d", os.Getpid())
+	}
+
 	return &MqttClient{
 		Connected:         false,
+		RetryConnect:      true,
 		ClientIdentifier:  client_id,
 		Conn:              nil,
 		SubscribeCallback: defaultSubscribeCallback,
@@ -71,51 +112,38 @@ func NewMqttClient(client_id string, server string) *MqttClient {
 		Transactions:      nil,
 		Terminate:         nil,
 		LastTransaction:   0,
-		ServerName:        server,
-		ServerAddr:        nil,
+		ServerURL:         u,
 		TXQueue:           nil,
 		RXQueue:           nil,
-	}
+	}, nil
 }
 
 func (c *MqttClient) Connect() error {
-
-	server_addr, err := net.ResolveTCPAddr("tcp", c.ServerName)
 
 	if c.Connected {
 		panic("Already connected")
 	}
 
-	if err != nil {
-		return err
-	}
-	c.ServerAddr = server_addr
-
-	if err = c.performConnect(); err != nil {
+	if err := c.performConnect(); err != nil {
 		return err
 	}
 
-	c.Terminate = make(chan bool)
-	c.Transactions = make(map[uint16]*MqttTransaction)
-	c.TXQueue = make(chan *MqttMessage, 8)
-	c.RXQueue = make(chan *MqttMessage, 8)
-	c.Connected = true
-
-	go c.serverRun()
-	c.Ticker = time.NewTicker(time.Duration(c.PingInterval) * time.Second)
-	if c.OnConnect != nil {
-		go c.OnConnect(c)
-	}
-
+	c.resetEventLoop()
+	go c.runEventLoop()
 	return nil
 }
 
 func (c *MqttClient) Disconnect() {
 	c.TXQueue <- NewMqttMessage(DISCONNECT)
+	c.RetryConnect = false
 	c.Terminate <- true
 }
 
 func (c *MqttClient) Subscribe(topic string) error {
+	if err := c.checkConnection(); err != nil {
+		return err
+	}
+
 	m := NewMqttMessage(SUBSCRIBE)
 	m.Qos = 1
 
@@ -135,6 +163,10 @@ func (c *MqttClient) Subscribe(topic string) error {
 }
 
 func (c *MqttClient) Unsubscribe(topic string) error {
+	if err := c.checkConnection(); err != nil {
+		return err
+	}
+
 	m := NewMqttMessage(UNSUBSCRIBE)
 	m.Qos = 1
 
@@ -153,6 +185,10 @@ func (c *MqttClient) Unsubscribe(topic string) error {
 }
 
 func (c *MqttClient) Publish(topic string, value []byte) error {
+	if err := c.checkConnection(); err != nil {
+		return err
+	}
+
 	m := NewMqttMessage(PUBLISH)
 	m.Qos = 1
 	m.VarHeader.AppendString(topic)
@@ -180,18 +216,41 @@ func (c* MqttClient) processMessageToSend(m *MqttMessage) error {
 */
 
 func (c *MqttClient) performConnect() error {
-	conn, err := net.DialTCP("tcp", nil, c.ServerAddr)
+	var err error
+	var conn net.Conn
+
+	if c.ServerURL.Scheme == "mqtts" {
+		conf := &tls.Config{
+			// empty
+		}
+		conn, err = tls.Dial("tcp", c.ServerURL.Host, conf)
+	} else {
+		conn, err = net.Dial("tcp", c.ServerURL.Host)
+	}
+
 	if err != nil {
 		return err
 	}
 	c.Conn = conn
 
 	m := NewMqttMessage(CONNECT)
+
+	m.Payload.AppendString(c.ClientIdentifier)
+
 	m.VarHeader.AppendString("MQTT")
 	m.VarHeader.AppendUint8(4)
-	m.VarHeader.AppendUint8(0)
+	connectFlags := uint8(0)
+	if c.ServerURL.User != nil {
+		connectFlags |= 0x80 // USERNAME FLAG
+		m.Payload.AppendString(c.ServerURL.User.Username())
+		pass, ok := c.ServerURL.User.Password()
+		if ok {
+			connectFlags |= 0x40 // PASSWORD FLAG
+			m.Payload.AppendString(pass)
+		}
+	}
+	m.VarHeader.AppendUint8(connectFlags)
 	m.VarHeader.AppendUint16(c.PingInterval)
-	m.Payload.AppendString(c.ClientIdentifier)
 
 	if err := MqttMessageWrite(c.Conn, m); err != nil {
 		return err
@@ -205,7 +264,7 @@ func (c *MqttClient) performConnect() error {
 	}
 	switch resp.VarHeader.Data[1] {
 	case 0:
-		fmt.Printf("Connected OK\n")
+		Logger.Info("Connected successfully to %s", c.ServerURL.Host)
 		return nil
 	case 1:
 		return fmt.Errorf("CONNACK returned 0x01 Connection Refused, unacceptable protocol version")
@@ -220,6 +279,7 @@ func (c *MqttClient) performConnect() error {
 	default:
 		return fmt.Errorf("CONNACK returned %02x", resp.VarHeader.Data[1])
 	}
+
 }
 
 func (c *MqttClient) processMessageReceived(m *MqttMessage) error {
@@ -255,18 +315,17 @@ func (c *MqttClient) processMessageReceived(m *MqttMessage) error {
 	return nil
 }
 
-func (c *MqttClient) serverRun() {
-	c.Conn.SetLinger(0)
-
+func (c *MqttClient) readerRun() {
 	conn := c.Conn
 	for {
 		m, err := MqttMessageRead(conn)
 		if err != nil {
-			fmt.Printf("Exiting read loop: %s\n", err)
+			Logger.Debug("Exiting read loop: %s\n", err)
 			break
 		}
 		c.RXQueue <- m
 	}
+	c.Terminate <- true
 }
 
 func (c *MqttClient) closeConnection() {
@@ -275,28 +334,39 @@ func (c *MqttClient) closeConnection() {
 	c.Ticker.Stop()
 }
 
-func (c *MqttClient) Run() {
+func (c *MqttClient) resetEventLoop() {
+	c.Terminate = make(chan bool)
+	c.Transactions = make(map[uint16]*MqttTransaction)
+	c.TXQueue = make(chan *MqttMessage, 8)
+	c.RXQueue = make(chan *MqttMessage, 8)
+
+	go c.readerRun()
+	c.Ticker = time.NewTicker(time.Duration(c.PingInterval) * time.Second)
+	if c.OnConnect != nil {
+		c.OnConnect(c)
+	}
+	c.Connected = true
+}
+
+func (c *MqttClient) runEventLoop() {
 	var err error
 
-	for {
+	for c.RetryConnect == true {
 		for !c.Connected {
-			if err = c.Connect(); err != nil {
+			if err = c.performConnect(); err != nil {
 				time.Sleep(3)
+			} else {
+				c.resetEventLoop()
 			}
 		}
 
 		select {
 		case m := <-c.TXQueue:
-			//if c.Connected {
 			err = MqttMessageWrite(c.Conn, m)
-			//}
 		case m := <-c.RXQueue:
-			//if c.Connected {
 			err = c.processMessageReceived(m)
-			//} /* else silently drop packet */
 		case <-c.Terminate:
-			c.closeConnection()
-			return
+			err = fmt.Errorf("Received connection terminate request")
 		case <-c.Ticker.C:
 			c.TXQueue <- NewMqttMessage(PINGREQ)
 			// TODO: scan transactions for idle ones, remove them / resend them
@@ -304,6 +374,7 @@ func (c *MqttClient) Run() {
 			err = nil
 		}
 		if err != nil {
+			Logger.Info("Closing connection to %s: %s\n", c.ServerURL.Host, err)
 			c.closeConnection()
 		}
 	}

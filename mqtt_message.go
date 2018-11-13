@@ -1,4 +1,4 @@
-package mqtt_mini_client
+package gomqtt_mini_client
 
 import (
 	"errors"
@@ -179,7 +179,7 @@ func MqttMessageWrite(dest io.Writer, m *MqttMessage) error {
 	buf.AppendBuffer(m.VarHeader)
 	buf.AppendBuffer(m.Payload)
 
-	fmt.Printf("Sending %q\n", buf.Data)
+	Logger.DebugX("Sending %s: %q", m.ControlPacketType, buf.Data)
 	n, err := dest.Write(buf.Data)
 	if err != nil {
 		return err
@@ -199,7 +199,6 @@ func MqttReadLength(source io.Reader) (uint32, error) {
 		if _, err := source.Read(b[:]); err != nil {
 			return 0, err
 		}
-		fmt.Printf("length byte %02x - ", b[0])
 		length |= uint32(b[0]&0x7F) << (i * 7)
 
 		if b[0]&0x80 == 0 {
@@ -216,7 +215,6 @@ func MqttMessageRead(source io.Reader) (*MqttMessage, error) {
 	if _, err := source.Read(head[:]); err != nil {
 		return nil, err
 	}
-	fmt.Printf("Received header %02x - ", head[0])
 
 	m := NewMqttMessage(MqttControlPacketType(head[0] & 0xF0))
 	if (head[0] & 1) != 0 {
@@ -241,7 +239,7 @@ func MqttMessageRead(source io.Reader) (*MqttMessage, error) {
 		return nil, err
 	}
 
-	fmt.Printf("body %q\n", buf)
+	Logger.DebugX("Got %s(0x%2x), length %d, body %q", m.ControlPacketType, head[0], length, buf)
 
 	switch m.ControlPacketType {
 	case CONNECT:
