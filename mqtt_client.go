@@ -59,19 +59,27 @@ func (c *MqttClient) findTransaction(packet_id uint16) *MqttTransaction {
 }
 
 func (c *MqttClient) releaseTransaction(transaction *MqttTransaction) {
-	close(transaction.Response)
 	delete(c.Transactions, transaction.PacketIdentifier)
+	close(transaction.Response)
 }
 
 func defaultSubscribeCallback(topic string, value []byte) {
 	Logger.Debug("Topic '%s' updated to %q\n", topic, value)
 }
 
+func (c *MqttClient) serverName() string {
+	s := ""
+	if c.ServerURL.User != nil {
+		s += c.ServerURL.User.Username() + "@"
+	}
+	return s + c.ServerURL.Host
+}
+
 func (c *MqttClient) checkConnection() error {
 	if c.Connected {
 		return nil
 	}
-	return fmt.Errorf("Not connected to %s://%s", c.ServerURL.Scheme, c.ServerURL.Host)
+	return fmt.Errorf("Not connected to %s", c.serverName())
 }
 
 func NewMqttClient(client_id string, server string) (*MqttClient, error) {
@@ -128,8 +136,8 @@ func (c *MqttClient) Connect() error {
 		return err
 	}
 
-	c.resetEventLoop()
 	go c.runEventLoop()
+
 	return nil
 }
 
@@ -264,7 +272,7 @@ func (c *MqttClient) performConnect() error {
 	}
 	switch resp.VarHeader.Data[1] {
 	case 0:
-		Logger.Info("Connected successfully to %s", c.ServerURL.Host)
+		Logger.Info("Connected successfully to %s", c.serverName())
 		return nil
 	case 1:
 		return fmt.Errorf("CONNACK returned 0x01 Connection Refused, unacceptable protocol version")
@@ -316,11 +324,12 @@ func (c *MqttClient) processMessageReceived(m *MqttMessage) error {
 }
 
 func (c *MqttClient) readerRun() {
+	Logger.DebugXX("Starting reader loop")
 	conn := c.Conn
 	for {
 		m, err := MqttMessageRead(conn)
 		if err != nil {
-			Logger.Debug("Exiting read loop: %s\n", err)
+			Logger.Debug("Exiting read loop: %s", err)
 			break
 		}
 		c.RXQueue <- m
@@ -330,6 +339,10 @@ func (c *MqttClient) readerRun() {
 
 func (c *MqttClient) closeConnection() {
 	c.Connected = false
+	for _, transaction := range c.Transactions {
+		Logger.DebugXX("Transaction %d was cancelled while waiting for packet %s", transaction.PacketIdentifier, transaction.ExpectedControlPacketType)
+		transaction.Response <- nil
+	}
 	c.Conn.Close()
 	c.Ticker.Stop()
 }
@@ -341,21 +354,30 @@ func (c *MqttClient) resetEventLoop() {
 	c.RXQueue = make(chan *MqttMessage, 8)
 
 	go c.readerRun()
+
 	c.Ticker = time.NewTicker(time.Duration(c.PingInterval) * time.Second)
-	if c.OnConnect != nil {
-		c.OnConnect(c)
-	}
 	c.Connected = true
+	if c.OnConnect != nil {
+		go c.OnConnect(c)
+	}
 }
 
 func (c *MqttClient) runEventLoop() {
 	var err error
+	var backoff time.Duration = 3
+
+	c.resetEventLoop()
 
 	for c.RetryConnect == true {
 		for !c.Connected {
 			if err = c.performConnect(); err != nil {
-				time.Sleep(3)
+				Logger.DebugXX("Failed to connect to %s, waiting %d seconds to try again...", c.serverName(), backoff)
+				time.Sleep(backoff * time.Second)
+				if backoff < 60 {
+					backoff *= 2
+				}
 			} else {
+				backoff = 3
 				c.resetEventLoop()
 			}
 		}
@@ -374,7 +396,7 @@ func (c *MqttClient) runEventLoop() {
 			err = nil
 		}
 		if err != nil {
-			Logger.Info("Closing connection to %s: %s\n", c.ServerURL.Host, err)
+			Logger.Info("Closing connection to %s: %s", c.ServerURL.Host, err)
 			c.closeConnection()
 		}
 	}
