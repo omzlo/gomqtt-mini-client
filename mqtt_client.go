@@ -38,6 +38,26 @@ type MqttClient struct {
 
 type MqttCallback func(topic string, value []byte)
 
+func (c *MqttClient) serverName() string {
+	s := ""
+	if c.ServerURL.User != nil {
+		s += c.ServerURL.User.Username() + "@"
+	}
+	return s + c.ServerURL.Host
+}
+
+func (c *MqttClient) checkConnection() error {
+	if c.Connected {
+		return nil
+	}
+	return fmt.Errorf("Not connected to %s", c.serverName())
+}
+
+/*****************************************
+ * Transaction management
+ *
+ */
+
 func (c *MqttClient) allocateTransaction(expected MqttControlPacketType) *MqttTransaction {
 	c.LastTransaction++
 	transaction := &MqttTransaction{
@@ -67,20 +87,10 @@ func defaultSubscribeCallback(topic string, value []byte) {
 	Logger.Debug("Topic '%s' updated to %q\n", topic, value)
 }
 
-func (c *MqttClient) serverName() string {
-	s := ""
-	if c.ServerURL.User != nil {
-		s += c.ServerURL.User.Username() + "@"
-	}
-	return s + c.ServerURL.Host
-}
-
-func (c *MqttClient) checkConnection() error {
-	if c.Connected {
-		return nil
-	}
-	return fmt.Errorf("Not connected to %s", c.serverName())
-}
+/****************************************
+ * Main functions
+ *
+ */
 
 func NewMqttClient(client_id string, server string) (*MqttClient, error) {
 	u, err := url.Parse(server)
@@ -216,12 +226,10 @@ func (c *MqttClient) Publish(topic string, value []byte) error {
 	return nil
 }
 
-/****/
-/*
-func (c* MqttClient) processMessageToSend(m *MqttMessage) error {
-  return MqttMessageWrite(c.Conn,m)
-}
-*/
+/********************************************
+ * Connection management
+ *
+ */
 
 func (c *MqttClient) performConnect() error {
 	var err error
