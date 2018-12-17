@@ -19,8 +19,10 @@ type MqttTransaction struct {
 	Response                  chan *MqttMessage
 }
 
+type MqttClientState int
+
 type MqttClient struct {
-	Connected         bool
+	State             MqttClientState
 	RetryConnect      bool
 	ClientIdentifier  string
 	Conn              net.Conn
@@ -36,6 +38,12 @@ type MqttClient struct {
 	OnConnect         func(*MqttClient)
 }
 
+const (
+	MQTT_CLIENT_CLOSED MqttClientState = iota
+	MQTT_CLIENT_DIALED
+	MQTT_CLIENT_CONNECTED
+)
+
 type MqttCallback func(topic string, value []byte)
 
 func (c *MqttClient) serverName() string {
@@ -47,7 +55,7 @@ func (c *MqttClient) serverName() string {
 }
 
 func (c *MqttClient) checkConnection() error {
-	if c.Connected {
+	if c.State == MQTT_CLIENT_CONNECTED {
 		return nil
 	}
 	return fmt.Errorf("Not connected to %s", c.serverName())
@@ -121,7 +129,7 @@ func NewMqttClient(client_id string, server string) (*MqttClient, error) {
 	}
 
 	return &MqttClient{
-		Connected:         false,
+		State:             MQTT_CLIENT_CLOSED,
 		RetryConnect:      true,
 		ClientIdentifier:  client_id,
 		Conn:              nil,
@@ -136,25 +144,98 @@ func NewMqttClient(client_id string, server string) (*MqttClient, error) {
 	}, nil
 }
 
+func (c *MqttClient) Connected() bool {
+	return c.State == MQTT_CLIENT_CONNECTED
+}
+
+func (c *MqttClient) Dial() error {
+	var conn net.Conn
+	var err error
+
+	if c.State == MQTT_CLIENT_DIALED || c.State == MQTT_CLIENT_CONNECTED {
+		return fmt.Errorf("MQTT Dial() called on network connection already established with %s.", c.serverName())
+	}
+
+	if c.ServerURL.Scheme == "mqtts" {
+		conf := &tls.Config{
+			// empty
+		}
+		conn, err = tls.Dial("tcp", c.ServerURL.Host, conf)
+	} else {
+		conn, err = net.Dial("tcp", c.ServerURL.Host)
+	}
+
+	c.Conn = conn
+	return err
+}
+
 func (c *MqttClient) Connect() error {
 
-	if c.Connected {
-		panic("Already connected")
+	if c.State == MQTT_CLIENT_CONNECTED {
+		return fmt.Errorf("MQTT Connect() already called on connection with %s.", c.serverName())
 	}
 
-	if err := c.performConnect(); err != nil {
+	if c.State != MQTT_CLIENT_DIALED {
+		if err := c.Dial(); err != nil {
+			return err
+		}
+	}
+
+	m := NewMqttMessage(CONNECT)
+
+	m.Payload.AppendString(c.ClientIdentifier)
+
+	m.VarHeader.AppendString("MQTT")
+	m.VarHeader.AppendUint8(4)
+	connectFlags := uint8(0)
+	if c.ServerURL.User != nil {
+		connectFlags |= 0x80 // USERNAME FLAG
+		m.Payload.AppendString(c.ServerURL.User.Username())
+		pass, ok := c.ServerURL.User.Password()
+		if ok {
+			connectFlags |= 0x40 // PASSWORD FLAG
+			m.Payload.AppendString(pass)
+		}
+	}
+	m.VarHeader.AppendUint8(connectFlags)
+	m.VarHeader.AppendUint16(c.PingInterval)
+
+	if err := MqttMessageWrite(c.Conn, m); err != nil {
 		return err
 	}
-
-	go c.runEventLoop()
-
-	return nil
+	resp, err := MqttMessageRead(c.Conn)
+	if err != nil {
+		return err
+	}
+	if resp.ControlPacketType != CONNACK {
+		return fmt.Errorf("Expected CONNACK from server, got %s instead", resp.ControlPacketType)
+	}
+	switch resp.VarHeader.Data[1] {
+	case 0:
+		c.State = MQTT_CLIENT_CONNECTED
+		Logger.Info("Connected successfully to %s", c.serverName())
+		return nil
+	case 1:
+		return fmt.Errorf("CONNACK returned 0x01 Connection Refused, unacceptable protocol version")
+	case 2:
+		return fmt.Errorf("CONNACK returned 0x02 Connection Refused, identifier rejected")
+	case 3:
+		return fmt.Errorf("CONNACK returned 0x03 Connection Refused, Server unavailable")
+	case 4:
+		return fmt.Errorf("CONNACK returned 0x04 Connection Refused, bad user name or password")
+	case 5:
+		return fmt.Errorf("CONNACK returned 0x05 Connection Refused, not authorized")
+	default:
+		return fmt.Errorf("CONNACK returned unexpected status %02x", resp.VarHeader.Data[1])
+	}
 }
 
 func (c *MqttClient) Disconnect() {
-	c.TXQueue <- NewMqttMessage(DISCONNECT)
-	c.RetryConnect = false
-	c.Terminate <- true
+	if c.State == MQTT_CLIENT_CONNECTED {
+		c.TXQueue <- NewMqttMessage(DISCONNECT)
+		c.RetryConnect = false
+		c.Terminate <- true
+	}
 }
 
 func (c *MqttClient) Subscribe(topic string) error {
@@ -226,76 +307,33 @@ func (c *MqttClient) Publish(topic string, value []byte) error {
 	return nil
 }
 
+func (c *MqttClient) RunEventLoop() error {
+	return c.runEventLoop()
+}
+
 /********************************************
  * Connection management
  *
  */
 
 func (c *MqttClient) performConnect() error {
-	var err error
-	var conn net.Conn
-
-	if c.ServerURL.Scheme == "mqtts" {
-		conf := &tls.Config{
-			// empty
-		}
-		conn, err = tls.Dial("tcp", c.ServerURL.Host, conf)
-	} else {
-		conn, err = net.Dial("tcp", c.ServerURL.Host)
-	}
-
-	if err != nil {
-		return err
-	}
-	c.Conn = conn
-
-	m := NewMqttMessage(CONNECT)
-
-	m.Payload.AppendString(c.ClientIdentifier)
-
-	m.VarHeader.AppendString("MQTT")
-	m.VarHeader.AppendUint8(4)
-	connectFlags := uint8(0)
-	if c.ServerURL.User != nil {
-		connectFlags |= 0x80 // USERNAME FLAG
-		m.Payload.AppendString(c.ServerURL.User.Username())
-		pass, ok := c.ServerURL.User.Password()
-		if ok {
-			connectFlags |= 0x40 // PASSWORD FLAG
-			m.Payload.AppendString(pass)
+	if c.State != MQTT_CLIENT_CONNECTED {
+		if err := c.Connect(); err != nil {
+			return err
 		}
 	}
-	m.VarHeader.AppendUint8(connectFlags)
-	m.VarHeader.AppendUint16(c.PingInterval)
+	c.Terminate = make(chan bool)
+	c.Transactions = make(map[uint16]*MqttTransaction)
+	c.TXQueue = make(chan *MqttMessage, 8)
+	c.RXQueue = make(chan *MqttMessage, 8)
 
-	if err := MqttMessageWrite(c.Conn, m); err != nil {
-		return err
-	}
-	resp, err := MqttMessageRead(c.Conn)
-	if err != nil {
-		return err
-	}
-	if resp.ControlPacketType != CONNACK {
-		return fmt.Errorf("Expected CONNACK from server, got %s instead", resp.ControlPacketType)
-	}
-	switch resp.VarHeader.Data[1] {
-	case 0:
-		Logger.Info("Connected successfully to %s", c.serverName())
-		return nil
-	case 1:
-		return fmt.Errorf("CONNACK returned 0x01 Connection Refused, unacceptable protocol version")
-	case 2:
-		return fmt.Errorf("CONNACK returned 0x02 Connection Refused, identifier rejected")
-	case 3:
-		return fmt.Errorf("CONNACK returned 0x03 Connection Refused, Server unavailable")
-	case 4:
-		return fmt.Errorf("CONNACK returned 0x04 Connection Refused, bad user name or password")
-	case 5:
-		return fmt.Errorf("CONNACK returned 0x05 Connection Refused, not authorized")
-	default:
-		return fmt.Errorf("CONNACK returned %02x", resp.VarHeader.Data[1])
-	}
+	go c.readerRun()
 
+	c.Ticker = time.NewTicker(time.Duration(c.PingInterval) * time.Second)
+	if c.OnConnect != nil {
+		go c.OnConnect(c)
+	}
+	return nil
 }
 
 func (c *MqttClient) processMessageReceived(m *MqttMessage) error {
@@ -346,7 +384,7 @@ func (c *MqttClient) readerRun() {
 }
 
 func (c *MqttClient) closeConnection() {
-	c.Connected = false
+	c.State = MQTT_CLIENT_CLOSED
 	for _, transaction := range c.Transactions {
 		Logger.DebugXX("Transaction %d was cancelled while waiting for packet %s", transaction.PacketIdentifier, transaction.ExpectedControlPacketType)
 		transaction.Response <- nil
@@ -355,38 +393,25 @@ func (c *MqttClient) closeConnection() {
 	c.Ticker.Stop()
 }
 
-func (c *MqttClient) resetEventLoop() {
-	c.Terminate = make(chan bool)
-	c.Transactions = make(map[uint16]*MqttTransaction)
-	c.TXQueue = make(chan *MqttMessage, 8)
-	c.RXQueue = make(chan *MqttMessage, 8)
-
-	go c.readerRun()
-
-	c.Ticker = time.NewTicker(time.Duration(c.PingInterval) * time.Second)
-	c.Connected = true
-	if c.OnConnect != nil {
-		go c.OnConnect(c)
-	}
-}
-
-func (c *MqttClient) runEventLoop() {
-	var err error
+func (c *MqttClient) runEventLoop() error {
 	var backoff time.Duration = 3
-
-	c.resetEventLoop()
+	var err error
 
 	for c.RetryConnect == true {
-		for !c.Connected {
+		for c.State != MQTT_CLIENT_CONNECTED {
 			if err = c.performConnect(); err != nil {
-				Logger.DebugXX("Failed to connect to %s, waiting %d seconds to try again...", c.serverName(), backoff)
-				time.Sleep(backoff * time.Second)
-				if backoff < 60 {
-					backoff *= 2
+				if c.RetryConnect {
+					Logger.Warning("Failed to connect to %s, waiting %d seconds to try again...", c.serverName(), backoff)
+					time.Sleep(backoff * time.Second)
+					if backoff < 60 {
+						backoff *= 2
+					}
+				} else {
+					Logger.Error("Failed to connect to %s.", c.serverName())
+					break
 				}
 			} else {
 				backoff = 3
-				c.resetEventLoop()
 			}
 		}
 
@@ -408,4 +433,5 @@ func (c *MqttClient) runEventLoop() {
 			c.closeConnection()
 		}
 	}
+	return err
 }
