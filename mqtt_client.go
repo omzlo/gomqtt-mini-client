@@ -355,7 +355,7 @@ func (c *MqttClient) processMessageReceived(m *MqttMessage) error {
 			return fmt.Errorf("Received PUBLISH packet without topic")
 		}
 		if packet_id == nil {
-			return fmt.Errorf("Received PUBLISH packet withou missing packet id")
+			return fmt.Errorf("Received PUBLISH packet with missing packet id")
 		}
 		c.SubscribeCallback(string(topic_name), m.Payload.Data)
 		if m.Qos == 1 {

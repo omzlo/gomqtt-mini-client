@@ -225,6 +225,10 @@ func MqttMessageRead(source io.Reader) (*MqttMessage, error) {
 	}
 	m.Qos = (head[0] >> 1) & 3
 
+	if m.Qos == 3 {
+		return nil, errors.New("Illegal QOS value (3) in packet.")
+	}
+
 	length, err := MqttReadLength(source)
 	if err != nil {
 		return nil, err
@@ -256,8 +260,8 @@ func MqttMessageRead(source io.Reader) (*MqttMessage, error) {
 		if length < 2 {
 			return nil, errors.New("PUBLISH var header is incomplete")
 		}
-		skip = 2 + (uint32(buf[0]) << 8) | uint32(buf[1])
-		if m.Qos == 1 {
+		skip = 2 + ((uint32(buf[0]) << 8) | uint32(buf[1]))
+		if m.Qos >= 1 {
 			skip += 2
 		}
 		if length < skip {
