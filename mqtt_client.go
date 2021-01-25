@@ -213,7 +213,7 @@ func (c *MqttClient) Connect() error {
 	switch resp.VarHeader.Data[1] {
 	case 0:
 		c.State = MQTT_CLIENT_CONNECTED
-		Logger.Info("Connected successfully to %s", c.serverName())
+		Logger.Info("Connected successfully to %s as %s", c.serverName(), c.ClientIdentifier)
 		return nil
 	case 1:
 		return fmt.Errorf("CONNACK returned 0x01 Connection Refused, unacceptable protocol version")
@@ -384,6 +384,9 @@ func (c *MqttClient) readerRun() {
 }
 
 func (c *MqttClient) closeConnection() {
+	/* TODO: check if there is not a race condition here when sending something to transaction.Response vs. releaseTransaction()
+	 * 		 We might need to simplify the code.
+	 */
 	c.State = MQTT_CLIENT_CLOSED
 	for _, transaction := range c.Transactions {
 		Logger.DebugXX("Transaction %d was cancelled while waiting for packet %s", transaction.PacketIdentifier, transaction.ExpectedControlPacketType)
