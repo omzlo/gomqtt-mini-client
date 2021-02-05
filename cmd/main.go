@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"github.com/omzlo/clog"
-	"github.com/omzlo/gomqtt_mini_client"
+	"github.com/omzlo/gomqtt-mini-client"
 	"os"
 	"time"
 )
@@ -34,15 +34,28 @@ func main() {
 	}
 
 	client.Subscribe("/demo")
-	for {
-		time.Sleep(3 * time.Second)
-		if err = client.Publish("/counter", []byte(fmt.Sprintf("%d", counter))); err != nil {
-			clog.Warning("Failed to send counter %d", counter)
-		} else {
-			clog.Info("Successfully sent counter %d", counter)
-			counter++
+
+	go func() {
+		clog.Info("Publish looper")
+		for {
+			for i := 0; i < 20; i++ {
+				clog.Info("Publish counter as %d", counter)
+				if err = client.Publish("/counter", []byte(fmt.Sprintf("%d", counter))); err != nil {
+					clog.Warning("Failed to send counter %d", counter)
+				} else {
+					clog.Info("Successfully sent counter %d", counter)
+					counter++
+				}
+			}
+			time.Sleep(10 * time.Second)
+			client.Disconnect()
+			break
 		}
+	}()
+
+	client.SubscribeCallback = func(topic string, value []byte) {
+		clog.Info("Got %s on %s", string(value), topic)
 	}
 
-	fmt.Println("Done.")
+	clog.Fatal("%s", client.RunEventLoop())
 }
