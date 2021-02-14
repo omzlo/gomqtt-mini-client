@@ -286,7 +286,7 @@ func (c *MqttClient) closeConnection() {
 }
 
 func (c *MqttClient) runEventLoop() error {
-	var backoff time.Duration = 3
+	var backoff time.Duration = 2
 	var err error
 
 	for {
@@ -295,14 +295,14 @@ func (c *MqttClient) runEventLoop() error {
 				if c.RetryConnect {
 					Logger.Warning("Failed to connect to %s, waiting %d seconds to try again...", c.serverName(), backoff)
 					time.Sleep(backoff * time.Second)
-					if backoff < 60 {
+					if backoff < 16 {
 						backoff *= 2
 					}
 				} else {
 					return fmt.Errorf("Failed to connect to %s.", c.serverName())
 				}
 			} else {
-				backoff = 3
+				backoff = 2
 			}
 		}
 
