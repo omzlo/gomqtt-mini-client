@@ -3,6 +3,7 @@ package gomqtt_mini_client
 import (
 	"errors"
 	"fmt"
+	"github.com/omzlo/clog"
 	"io"
 )
 
@@ -179,7 +180,6 @@ func MqttMessageWrite(dest io.Writer, m *MqttMessage) error {
 	buf.AppendBuffer(m.VarHeader)
 	buf.AppendBuffer(m.Payload)
 
-	Logger.DebugX("Sending %s: %q", m.ControlPacketType, buf.Data)
 	n, err := dest.Write(buf.Data)
 	if err != nil {
 		return err
@@ -187,6 +187,7 @@ func MqttMessageWrite(dest io.Writer, m *MqttMessage) error {
 	if n != len(buf.Data) {
 		return fmt.Errorf("Write of %s message failed, %d bytes of %d transmitted", m.ControlPacketType, n, len(buf.Data))
 	}
+	Logger.DebugXX("MQTT WROTE %s[q:%d,p:%d] %q", m.ControlPacketType, m.Qos, m.GetPacketIdentifier(), buf.Data)
 	return nil
 }
 
@@ -242,8 +243,6 @@ func MqttMessageRead(source io.Reader) (*MqttMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	Logger.DebugX("Got %s(0x%2x), length %d, body %q", m.ControlPacketType, head[0], length, buf)
 
 	switch m.ControlPacketType {
 	case CONNECT:
@@ -323,5 +322,6 @@ func MqttMessageRead(source io.Reader) (*MqttMessage, error) {
 	default:
 		return nil, fmt.Errorf("Unexpected packet type: %d", m.ControlPacketType)
 	}
+	clog.DebugXX("MQTT READ %s[q:%d, p:%d] %q", m.ControlPacketType, m.Qos, m.GetPacketIdentifier(), buf)
 	return m, nil
 }

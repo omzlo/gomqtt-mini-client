@@ -2,6 +2,7 @@ package gomqtt_mini_client
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"github.com/omzlo/clog"
 	"net"
@@ -15,17 +16,10 @@ var Logger *clog.LogManager = clog.DefaultLogManager
 
 type MqttClientState int
 
-type MqttResponse struct {
-	Message *MqttMessage
-	Error   error
-}
-
-func CreateMqttResponseError(err error) MqttResponse {
-	return MqttResponse{Message: nil, Error: err}
-}
-
-func CreateMqttResponse(msg *MqttMessage) MqttResponse {
-	return MqttResponse{Message: msg, Error: nil}
+type MqttClientRequest struct {
+	ControlPacketType MqttControlPacketType
+	ResponseCallback  func(*MqttClient, error) error
+	CreatedAt         time.Time
 }
 
 type MqttClient struct {
@@ -37,17 +31,21 @@ type MqttClient struct {
 	LastPacketIdentifier uint16
 	SubscribeCallback    MqttCallback
 	PingInterval         time.Duration
-	Terminate            chan bool
+	terminationChannel   chan error
 	ServerURL            *url.URL
-	RXQueue              chan MqttResponse
-	Ticker               *time.Ticker
-	OnConnect            func(*MqttClient)
+	pendingRequests      map[uint16]*MqttClientRequest
+	OnConnect            func(*MqttClient) error
 }
 
 const (
 	MQTT_CLIENT_CLOSED MqttClientState = iota
 	MQTT_CLIENT_DIALED
 	MQTT_CLIENT_CONNECTED
+)
+
+var (
+	Terminate    = errors.New("MQTT client connection was terminated")
+	TimeoutError = errors.New("Timed out while waiting for MQTT ack")
 )
 
 type MqttCallback func(topic string, value []byte)
@@ -112,9 +110,9 @@ func NewMqttClient(client_id string, server string) (*MqttClient, error) {
 		LastPacketIdentifier: 0,
 		SubscribeCallback:    defaultSubscribeCallback,
 		PingInterval:         60 * time.Second,
-		Terminate:            nil,
+		terminationChannel:   make(chan error, 1),
 		ServerURL:            u,
-		RXQueue:              nil,
+		pendingRequests:      make(map[uint16]*MqttClientRequest),
 		OnConnect:            nil,
 	}, nil
 }
@@ -123,13 +121,9 @@ func (c *MqttClient) Connected() bool {
 	return c.State == MQTT_CLIENT_CONNECTED
 }
 
-func (c *MqttClient) Dial() error {
+func (c *MqttClient) dial() error {
 	var conn net.Conn
 	var err error
-
-	if c.State == MQTT_CLIENT_DIALED || c.State == MQTT_CLIENT_CONNECTED {
-		return fmt.Errorf("MQTT Dial() called on network connection already established with %s.", c.serverName())
-	}
 
 	if c.ServerURL.Scheme == "mqtts" {
 		conf := &tls.Config{
@@ -141,193 +135,6 @@ func (c *MqttClient) Dial() error {
 	}
 
 	c.Conn = conn
-	return err
-}
-
-func (c *MqttClient) Connect() error {
-	if c.State != MQTT_CLIENT_CONNECTED {
-		if err := c.performConnect(); err != nil {
-			return err
-		}
-	}
-	c.Ticker = time.NewTicker(c.PingInterval)
-	c.RXQueue = make(chan MqttResponse, 8)
-	c.Terminate = make(chan bool)
-
-	go c.readerRun()
-
-	if c.OnConnect != nil {
-		go c.OnConnect(c)
-	}
-	clog.Debug("Connect() completed")
-	return nil
-}
-
-func (c *MqttClient) Disconnect() {
-	c.RetryConnect = false
-	if c.State == MQTT_CLIENT_CONNECTED {
-		c.Terminate <- true
-	}
-}
-
-func (c *MqttClient) SendMessage(msg *MqttMessage) error {
-	c.SendMutex.Lock()
-	defer c.SendMutex.Unlock()
-
-	if c.State != MQTT_CLIENT_CONNECTED {
-		return fmt.Errorf("Not connected to %s", c.serverName())
-	}
-
-	c.Ticker.Reset(c.PingInterval)
-	return MqttMessageWrite(c.Conn, msg)
-}
-
-func (c *MqttClient) ReceiveMessage(packet_type MqttControlPacketType) (*MqttMessage, error) {
-	response := <-c.RXQueue
-	if response.Error != nil {
-		return nil, response.Error
-	}
-	if response.Message.ControlPacketType != packet_type {
-		return nil, fmt.Errorf("Unexpected packet type %s in response", packet_type.String())
-	}
-	return response.Message, response.Error
-}
-
-func (c *MqttClient) ReceiveMessageWithPacketId(packet_type MqttControlPacketType, packet_id uint16) (*MqttMessage, error) {
-	m, e := c.ReceiveMessage(packet_type)
-	if e != nil {
-		return nil, e
-	}
-	if m.GetPacketIdentifier() != packet_id {
-		return nil, fmt.Errorf("Mismatched packet identifier, expeted %d, got %d", packet_id, m.GetPacketIdentifier())
-	}
-	return m, nil
-}
-
-func (c *MqttClient) Subscribe(topic string) error {
-	m := NewMqttMessage(SUBSCRIBE)
-	m.Qos = 1
-
-	pid := c.allocatePacketIdentifier()
-
-	m.VarHeader.AppendUint16(pid)
-	m.Payload.AppendString(topic).AppendUint8(0)
-
-	if err := c.SendMessage(m); err != nil {
-		return nil
-	}
-
-	_, err := c.ReceiveMessageWithPacketId(SUBACK, pid)
-	if err != nil {
-		return fmt.Errorf("Failed to subscribe to %s: %s", topic, err)
-	}
-	return nil
-}
-
-func (c *MqttClient) Unsubscribe(topic string) error {
-	m := NewMqttMessage(UNSUBSCRIBE)
-	m.Qos = 1
-
-	pid := c.allocatePacketIdentifier()
-
-	m.VarHeader.AppendUint16(pid)
-
-	if err := c.SendMessage(m); err != nil {
-		return nil
-	}
-
-	_, err := c.ReceiveMessageWithPacketId(UNSUBACK, pid)
-	if err != nil {
-		return fmt.Errorf("Failed to unsubscribe to %s: %s", topic, err)
-	}
-	return nil
-}
-
-func (c *MqttClient) Publish(topic string, value []byte) error {
-	m := NewMqttMessage(PUBLISH)
-	m.Qos = 1
-
-	pid := c.allocatePacketIdentifier()
-
-	m.VarHeader.AppendString(topic)
-	m.VarHeader.AppendUint16(pid)
-	m.Payload.AppendBytes(value)
-
-	if err := c.SendMessage(m); err != nil {
-		return nil
-	}
-	_, err := c.ReceiveMessageWithPacketId(PUBACK, pid)
-	if err != nil {
-		return fmt.Errorf("Failed to publish to %s: %s", topic, err)
-	}
-	return nil
-}
-
-func (c *MqttClient) RunEventLoop() error {
-	return c.runEventLoop()
-}
-
-/********************************************
- * Connection management
- *
- */
-
-func (c *MqttClient) readerRun() {
-	Logger.DebugXX("Starting MQTT message reader loop")
-	for c.processServerEvents() {
-	}
-	Logger.DebugXX("Leaving MQTT message reader loop")
-}
-
-func (c *MqttClient) closeConnection() {
-	c.State = MQTT_CLIENT_CLOSED
-	c.Conn.Close()
-	c.Ticker.Stop()
-}
-
-func (c *MqttClient) runEventLoop() error {
-	var backoff time.Duration = 2
-	var err error
-
-	for {
-		for c.State != MQTT_CLIENT_CONNECTED {
-			if err = c.Connect(); err != nil {
-				if c.RetryConnect {
-					Logger.Warning("Failed to connect to %s, waiting %d seconds to try again...", c.serverName(), backoff)
-					time.Sleep(backoff * time.Second)
-					if backoff < 16 {
-						backoff *= 2
-					}
-				} else {
-					return fmt.Errorf("Failed to connect to %s.", c.serverName())
-				}
-			} else {
-				backoff = 2
-			}
-		}
-
-		select {
-		case <-c.Terminate:
-			Logger.Info("Closing connection to %s due to termination signal.", c.ServerURL.Host)
-			c.closeConnection()
-			return fmt.Errorf("Disconnected")
-		case <-c.Ticker.C:
-			c.SendMessage(NewMqttMessage(PINGREQ))
-		}
-	}
-}
-
-func (c *MqttClient) performConnect() error {
-
-	if c.State == MQTT_CLIENT_CONNECTED {
-		return fmt.Errorf("MQTT Connect() already called on connection with %s.", c.serverName())
-	}
-
-	if c.State != MQTT_CLIENT_DIALED {
-		if err := c.Dial(); err != nil {
-			return err
-		}
-	}
 
 	m := NewMqttMessage(CONNECT)
 
@@ -363,7 +170,6 @@ func (c *MqttClient) performConnect() error {
 	case 0:
 		c.State = MQTT_CLIENT_CONNECTED
 		Logger.Info("Connected successfully to %s as %s", c.serverName(), c.ClientIdentifier)
-		return nil
 	case 1:
 		return fmt.Errorf("CONNACK returned 0x01 Connection Refused, unacceptable protocol version")
 	case 2:
@@ -377,46 +183,257 @@ func (c *MqttClient) performConnect() error {
 	default:
 		return fmt.Errorf("CONNACK returned unexpected status %02x", resp.VarHeader.Data[1])
 	}
+
+	go c.processMessageLoop()
+
+	if c.OnConnect != nil {
+		return c.OnConnect(c)
+	}
+	return nil
 }
 
 func (c *MqttClient) allocatePacketIdentifier() uint16 {
+	if c.LastPacketIdentifier == 0 {
+		c.LastPacketIdentifier = 1
+	}
 	pi := c.LastPacketIdentifier
 	c.LastPacketIdentifier++
 	return pi
 }
 
-func (c *MqttClient) processServerEvents() bool {
-	for {
-		msg, err := MqttMessageRead(c.Conn)
-		if err != nil {
-			c.RXQueue <- CreateMqttResponseError(err)
-			return false
+func (c *MqttClient) SendAsync(msg *MqttMessage, cb func(*MqttClient, error) error) {
+
+	switch msg.ControlPacketType {
+	case SUBSCRIBE, UNSUBSCRIBE, PUBLISH:
+		c.SendMutex.Lock()
+		msg.Qos = 1
+		pid := c.allocatePacketIdentifier()
+		msg.VarHeader.AppendUint16(pid)
+
+		c.pendingRequests[pid] = &MqttClientRequest{ControlPacketType: msg.ControlPacketType, ResponseCallback: cb, CreatedAt: time.Now()}
+		c.SendMutex.Unlock()
+	}
+	if err := MqttMessageWrite(c.Conn, msg); err != nil {
+		c.SendMutex.Lock()
+		delete(c.pendingRequests, msg.GetPacketIdentifier())
+		c.SendMutex.Unlock()
+		cb(c, err)
+	}
+}
+
+func (c *MqttClient) Send(msg *MqttMessage) error {
+	responder := make(chan error, 1)
+	c.SendAsync(msg, func(client *MqttClient, e error) error {
+		responder <- e
+		return nil
+	})
+	return <-responder
+}
+
+func (c *MqttClient) WaitTermination(duration time.Duration) error {
+	if duration == 0 {
+		err := <-c.terminationChannel
+		if err != Terminate {
+			return err
 		}
-		switch msg.ControlPacketType {
-		case PUBLISH:
-			topic_name, packet_id := SplitString(msg.VarHeader.Data)
-			if topic_name == nil {
-				c.RXQueue <- CreateMqttResponseError(fmt.Errorf("Received PUBLISH packet without topic"))
-				return false
-			}
-			if packet_id == nil {
-				c.RXQueue <- CreateMqttResponseError(fmt.Errorf("Received PUBLISH packet with missing packet id"))
-				return false
-			}
-			if msg.Qos == 1 {
-				response := NewMqttMessage(PUBACK)
-				response.VarHeader.AppendUint16(msg.GetPacketIdentifier())
-				if err := c.SendMessage(response); err != nil {
-					c.RXQueue <- CreateMqttResponseError(err)
-					return false
+		return nil
+	}
+
+	timeout := time.NewTimer(duration)
+
+	select {
+	case response := <-c.terminationChannel:
+		if !timeout.Stop() {
+			<-timeout.C
+		}
+		if response != Terminate {
+			return response
+		}
+		return nil
+	case <-timeout.C:
+		return TimeoutError
+	}
+}
+
+func (c *MqttClient) Terminate() error {
+	c.RetryConnect = false
+	return c.Close()
+}
+
+func (c *MqttClient) Close() error {
+
+	c.State = MQTT_CLIENT_CLOSED
+	c.Conn.Close()
+	return c.Conn.Close()
+}
+
+func (c *MqttClient) Connect() error {
+	return c.dial()
+}
+
+/*
+func (c *MqttClient) ReceiveMessageWithPacketId(packet_type MqttControlPacketType, packet_id uint16) (*MqttMessage, error) {
+	m, e := c.ReceiveMessage(packet_type)
+	if e != nil {
+		return nil, e
+	}
+	if m.GetPacketIdentifier() != packet_id {
+		return nil, fmt.Errorf("Mismatched packet identifier, expeted %d, got %d", packet_id, m.GetPacketIdentifier())
+	}
+	return m, nil
+}
+*/
+
+func (c *MqttClient) Subscribe(topic string) error {
+	m := NewMqttMessage(SUBSCRIBE)
+	m.Payload.AppendString(topic).AppendUint8(0)
+
+	return c.Send(m)
+}
+
+func (c *MqttClient) Unsubscribe(topic string) error {
+	m := NewMqttMessage(UNSUBSCRIBE)
+	m.Payload.AppendString(topic)
+
+	return c.Send(m)
+}
+
+func (c *MqttClient) Publish(topic string, value []byte) error {
+	m := NewMqttMessage(PUBLISH)
+	m.VarHeader.AppendString(topic)
+	m.Payload.AppendBytes(value)
+
+	return c.Send(m)
+}
+
+/********************************************
+ * Connection management
+ *
+ */
+
+func (c *MqttClient) processNextMessage() error {
+	var msg *MqttMessage
+	var err error
+
+	for {
+		err = c.Conn.SetReadDeadline(time.Now().Add(c.PingInterval))
+		if err != nil {
+			clog.Warning("MQTT SetReadDeadline failed: %s", err)
+			return err
+		}
+
+		msg, err = MqttMessageRead(c.Conn)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				ping := NewMqttMessage(PINGREQ)
+				if err := MqttMessageWrite(c.Conn, ping); err != nil {
+					return err
 				}
+			} else {
+				return err
 			}
-			c.SubscribeCallback(string(topic_name), msg.Payload.Data)
-		case PINGRESP:
-			/* Do nothing */
-		default:
-			c.RXQueue <- CreateMqttResponse(msg)
-			return true
+		} else {
+			break
 		}
 	}
+
+	switch msg.ControlPacketType {
+	case PUBLISH:
+		topic_name, packet_id := SplitString(msg.VarHeader.Data)
+		if topic_name == nil {
+			return fmt.Errorf("Received PUBLISH packet without topic")
+		}
+		if packet_id == nil {
+			return fmt.Errorf("Received PUBLISH packet with missing packet id")
+		}
+		if msg.Qos == 1 {
+			response := NewMqttMessage(PUBACK)
+			response.VarHeader.AppendUint16(msg.GetPacketIdentifier())
+			if err := MqttMessageWrite(c.Conn, response); err != nil {
+				return err
+			}
+		}
+		c.SubscribeCallback(string(topic_name), msg.Payload.Data)
+		return nil
+	case SUBACK, PUBACK, UNSUBACK:
+		pid := msg.GetPacketIdentifier()
+		c.SendMutex.Lock()
+		pd := c.pendingRequests[pid]
+		if pd != nil {
+			delete(c.pendingRequests, pid)
+		}
+		c.SendMutex.Unlock()
+		if pd == nil {
+			return fmt.Errorf("Recieved message with unexepected packet identifier %d", pid)
+		}
+		if msg.ControlPacketType == SUBACK && pd.ControlPacketType != SUBSCRIBE {
+			return fmt.Errorf("Recieved a SUBACK in response to a %s", pd.ControlPacketType)
+		}
+		if msg.ControlPacketType == UNSUBACK && pd.ControlPacketType != UNSUBSCRIBE {
+			return fmt.Errorf("Recieved a UNSUBACK in response to a %s", pd.ControlPacketType)
+		}
+		if msg.ControlPacketType == PUBACK && pd.ControlPacketType != PUBLISH {
+			return fmt.Errorf("Recieved a PUBACK in response to a %s", pd.ControlPacketType)
+		}
+		if err := pd.ResponseCallback(c, nil); err != nil {
+			return err
+		}
+
+		pd = nil
+		c.SendMutex.Lock()
+		for cptype, pd2 := range c.pendingRequests {
+			if time.Since(pd2.CreatedAt) > 3*time.Second {
+				delete(c.pendingRequests, cptype)
+				pd = pd2
+				break
+			}
+		}
+		c.SendMutex.Unlock()
+		if pd != nil {
+			if err := pd.ResponseCallback(c, TimeoutError); err != nil {
+				return err
+			}
+		}
+	case PINGRESP:
+		/* Do nothing */
+	default:
+		return fmt.Errorf("Unexpected packet control type from server: %s", msg.ControlPacketType)
+	}
+	return nil
+}
+
+func (c *MqttClient) processMessageLoop() {
+	var backoff time.Duration = 1
+	var err error
+
+	for {
+		if c.State != MQTT_CLIENT_CONNECTED {
+			err = c.dial()
+			if err != nil {
+				if !c.RetryConnect {
+					break
+				}
+				Logger.Warning("Failed to connect to %s, waiting %d seconds to try again...", c.serverName(), backoff)
+				time.Sleep(backoff * time.Second)
+				if backoff < 16 {
+					backoff *= 2
+				}
+				continue
+			}
+			backoff = 1
+		}
+
+		err := c.processNextMessage()
+		if err != nil {
+			c.Close()
+			if err == Terminate {
+				break
+			}
+			if !c.RetryConnect {
+				break
+			}
+			continue
+		}
+	}
+	c.terminationChannel <- err
 }
