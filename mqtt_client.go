@@ -35,6 +35,7 @@ type MqttClient struct {
 	ServerURL            *url.URL
 	pendingRequests      map[uint16]*MqttClientRequest
 	OnConnect            func(*MqttClient) error
+	TLSConfig            *tls.Config
 }
 
 const (
@@ -114,6 +115,7 @@ func NewMqttClient(client_id string, server string) (*MqttClient, error) {
 		ServerURL:            u,
 		pendingRequests:      make(map[uint16]*MqttClientRequest),
 		OnConnect:            nil,
+		TLSConfig:            &tls.Config{},
 	}, nil
 }
 
@@ -126,12 +128,13 @@ func (c *MqttClient) dial() error {
 	var err error
 
 	if c.ServerURL.Scheme == "mqtts" {
-		conf := &tls.Config{
-			// empty
-		}
-		conn, err = tls.Dial("tcp", c.ServerURL.Host, conf)
+		conn, err = tls.Dial("tcp", c.ServerURL.Host, c.TLSConfig)
 	} else {
 		conn, err = net.Dial("tcp", c.ServerURL.Host)
+	}
+
+	if err != nil {
+		return err
 	}
 
 	c.Conn = conn
