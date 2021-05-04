@@ -36,6 +36,7 @@ type MqttClient struct {
 	pendingRequests      map[uint16]*MqttClientRequest
 	OnConnect            func(*MqttClient) error
 	TLSConfig            *tls.Config
+	dialCount            int
 }
 
 const (
@@ -116,6 +117,7 @@ func NewMqttClient(client_id string, server string) (*MqttClient, error) {
 		pendingRequests:      make(map[uint16]*MqttClientRequest),
 		OnConnect:            nil,
 		TLSConfig:            &tls.Config{},
+		dialCount:            0,
 	}, nil
 }
 
@@ -187,7 +189,10 @@ func (c *MqttClient) dial() error {
 		return fmt.Errorf("CONNACK returned unexpected status %02x", resp.VarHeader.Data[1])
 	}
 
-	go c.processMessageLoop()
+	c.dialCount++
+	if c.dialCount == 1 {
+		go c.processMessageLoop()
+	}
 
 	if c.OnConnect != nil {
 		return c.OnConnect(c)
